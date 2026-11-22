@@ -367,7 +367,46 @@ static void *find_entry(const struct object_file *obj, const Elf64_Ehdr *eh,
     return NULL;
 }
 
-/* ================= 重定位（骨架，待实现） ================= */
+/* ================= 重定位 ================= */
+
+/* 写入函数负责边界与溢出检查；place 已限定在目标段内 */
+static bool store_u32(uint8_t *place, size_t avail, uint32_t value) {
+    if (avail < sizeof(value)) {
+        fprintf(stderr, "etrel: relocation out of section bounds\n");
+        return false;
+    }
+    memcpy(place, &value, sizeof(value));
+    return true;
+}
+
+static bool store_u64(uint8_t *place, size_t avail, uint64_t value) {
+    if (avail < sizeof(value)) {
+        fprintf(stderr, "etrel: relocation out of section bounds\n");
+        return false;
+    }
+    memcpy(place, &value, sizeof(value));
+    return true;
+}
+
+static bool store_pc32(uint8_t *place, size_t avail, int64_t value) {
+    if (value < INT32_MIN || value > INT32_MAX) {
+        fprintf(stderr, "etrel: PC-relative relocation overflow: %lld\n", (long long)value);
+        return false;
+    }
+    return store_u32(place, avail, (uint32_t)(int32_t)value);
+}
+
+/* 为 GOTPCREL* 分配一个 8 字节槽并写入符号地址（不做 relaxation） */
+static bool make_got_slot(uintptr_t sym, uint8_t **slot_out) {
+    void *slot = NULL;
+    if (!arena_alloc(sizeof(uint64_t), sizeof(uint64_t), &slot)) {
+        return false;
+    }
+    uint64_t value = (uint64_t)sym;
+    memcpy(slot, &value, sizeof(value));
+    *slot_out = slot;
+    return true;
+}
 
 static bool apply_relocations(const struct object_file *obj, const Elf64_Ehdr *eh,
                               const struct etrel_image *img) {
@@ -397,9 +436,10 @@ static bool apply_relocations(const struct object_file *obj, const Elf64_Ehdr *e
             unsigned type  = (unsigned)ELF64_R_TYPE(rela[j].r_info);
             size_t   index = (size_t)ELF64_R_SYM(rela[j].r_info);
 
-            if (rela[j].r_offset >= target->sh_size) {
+            if (rela[j].r_offset > target->sh_size) {
                 return false;
             }
+            size_t   avail = (size_t)(target->sh_size - rela[j].r_offset);
             uint8_t *place = img->section[sh[i].sh_info] + rela[j].r_offset;
 
             bool  ok = false;
@@ -407,27 +447,80 @@ static bool apply_relocations(const struct object_file *obj, const Elf64_Ehdr *e
             if (!ok) {
                 return false;
             }
-            (void)s;     /* TODO: 重定位时使用 */
-            (void)place; /* TODO: 重定位时使用 */
+
+            uintptr_t S = (uintptr_t)s;
+            uintptr_t P = (uintptr_t)place;
+            int64_t   A = (int64_t)rela[j].r_addend;
 
             switch (type) {
             case R_X86_64_NONE:
                 break;
 
-            case R_X86_64_PLT32: /* S + A - P，32 位：函数调用 */
-            case R_X86_64_PC32:  /* S + A - P，32 位：PC 相对引用 */
-            case R_X86_64_32:    /* S + A，32 位无符号 */
-            case R_X86_64_32S:   /* S + A，32 位有符号 */
-            case R_X86_64_64:    /* S + A，64 位 */
-                /*
-                 * TODO(步骤 7)：按 notes/M4.md §8.3 计算并写入。
-                 *   P = (uintptr_t)place
-                 *   PLT32/PC32: *(int32_t *)place = (int32_t)((uintptr_t)s + A - P)
-                 *   32/32S/64  : 绝对地址，注意溢出检查
-                 * 目前先明确报未实现，避免静默产生错误代码。
-                 */
-                fprintf(stderr, "etrel: relocation type %u not implemented yet\n", type);
-                return false;
+            case R_X86_64_PLT32: /* 函数调用：S + A - P */
+            case R_X86_64_PC32:  /* PC 相对引用：S + A - P */
+                if (!store_pc32(place, avail, (int64_t)S + A - (int64_t)P)) {
+                    return false;
+                }
+                break;
+
+            case R_X86_64_32: { /* 绝对地址，32 位零扩展 */
+                int64_t value = (int64_t)S + A;
+                if (value < 0 || (uint64_t)value > UINT32_MAX) {
+                    fprintf(stderr, "etrel: R_X86_64_32 overflow: 0x%llx\n",
+                            (unsigned long long)value);
+                    return false;
+                }
+                if (!store_u32(place, avail, (uint32_t)value)) {
+                    return false;
+                }
+                break;
+            }
+
+            case R_X86_64_32S: { /* 绝对地址，32 位符号扩展 */
+                int64_t value = (int64_t)S + A;
+                if (value < INT32_MIN || value > INT32_MAX) {
+                    fprintf(stderr, "etrel: R_X86_64_32S overflow: %lld\n",
+                            (long long)value);
+                    return false;
+                }
+                if (!store_u32(place, avail, (uint32_t)(int32_t)value)) {
+                    return false;
+                }
+                break;
+            }
+
+            case R_X86_64_64: /* 绝对地址，64 位 */
+                if (!store_u64(place, avail, (uint64_t)((int64_t)S + A))) {
+                    return false;
+                }
+                break;
+
+            case R_X86_64_PC64: /* PC 相对，64 位 */
+                if (!store_u64(place, avail,
+                               (uint64_t)((int64_t)S + A - (int64_t)P))) {
+                    return false;
+                }
+                break;
+
+            case R_X86_64_GOTPCREL:
+#ifdef R_X86_64_GOTPCRELX
+            case R_X86_64_GOTPCRELX:
+#endif
+#ifdef R_X86_64_REX_GOTPCRELX
+            case R_X86_64_REX_GOTPCRELX:
+#endif
+            {
+                /* 不实现 relaxation：分配真实 GOT 槽，位移指向该槽 */
+                uint8_t *slot = NULL;
+                if (!make_got_slot(S, &slot)) {
+                    return false;
+                }
+                if (!store_pc32(place, avail,
+                                (int64_t)(uintptr_t)slot + A - (int64_t)P)) {
+                    return false;
+                }
+                break;
+            }
 
             default:
                 fprintf(stderr, "etrel: unsupported relocation type %u\n", type);
