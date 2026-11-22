@@ -125,6 +125,8 @@ static void *compile_source(const char *source, const char *symbol) {
     unlink(src_path); // 编译完成，源码文件可以删除
 
     // 从 so_path 按需加载符号
+    // RTLD_GLOBAL 保证符号对后续库可见，避免重复编译同一函数
+    // RTLD_NOW 避免延迟解析符号，保证 dlsym 成功
     void *handle = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
     if (handle == NULL) {
         fprintf(stderr, "dlopen: %s\n", dlerror());
