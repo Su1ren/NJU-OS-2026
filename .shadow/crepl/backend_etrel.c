@@ -472,10 +472,11 @@ void *crepl_backend_etrel_load(const char *source, const char *symbol) {
     if (!image_build(&obj, eh, &img)) {
         goto out;
     }
-    if (!register_symbols(&obj, eh, &img)) {
+    /* 先确保重定位成功，再把本对象符号暴露给后续对象，避免失败镜像污染全局表 */
+    if (!apply_relocations(&obj, eh, &img)) {
         goto out;
     }
-    if (!apply_relocations(&obj, eh, &img)) {
+    if (!register_symbols(&obj, eh, &img)) {
         goto out;
     }
 
