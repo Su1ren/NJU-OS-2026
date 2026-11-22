@@ -3,13 +3,13 @@
 #include "compiler.h"
 
 #include <elf.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
 
 /*
@@ -98,11 +98,10 @@ static bool arena_alloc(size_t size, size_t align, void **out) {
     uint8_t *p = g_arena + start;
 
     /* 实验环境不要求 W^X，直接给 RWX 方便装载后执行 */
-    long   page      = sysconf(_SC_PAGESIZE);
-    size_t page_size = page > 0 ? (size_t)page : 4096;
+    long      page       = sysconf(_SC_PAGESIZE);
+    size_t    page_size  = page > 0 ? (size_t)page : 4096;
     uintptr_t page_start = (uintptr_t)p & ~(uintptr_t)(page_size - 1);
-    size_t    page_end   = ((uintptr_t)p - page_start + size + page_size - 1) &
-                           ~(page_size - 1);
+    size_t    page_end   = ((uintptr_t)p - page_start + size + page_size - 1) & ~(page_size - 1);
     if (mprotect((void *)page_start, page_end, PROT_READ | PROT_WRITE | PROT_EXEC) < 0) {
         perror("etrel: mprotect");
         return false;
@@ -155,8 +154,7 @@ static bool map_object(const char *path, struct object_file *obj) {
 static const Elf64_Ehdr *object_header(const struct object_file *obj) {
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)obj->data;
 
-    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
-        eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 || eh->e_ident[EI_CLASS] != ELFCLASS64 ||
         eh->e_ident[EI_DATA] != ELFDATA2LSB) {
         return NULL;
     }
@@ -243,14 +241,13 @@ static bool image_build(const struct object_file *obj, const Elf64_Ehdr *eh,
         size_t align = sh[i].sh_addralign != 0 ? (size_t)sh[i].sh_addralign : 1;
         cursor       = (cursor + align - 1) & ~(align - 1);
 
-        uint8_t *dst  = img->base + cursor;
+        uint8_t *dst    = img->base + cursor;
         img->section[i] = dst;
 
         if (sh[i].sh_type == SHT_NOBITS) {
             memset(dst, 0, sh[i].sh_size);
         } else {
-            if (sh[i].sh_offset > obj->size ||
-                sh[i].sh_size > obj->size - sh[i].sh_offset) {
+            if (sh[i].sh_offset > obj->size || sh[i].sh_size > obj->size - sh[i].sh_offset) {
                 fprintf(stderr, "etrel: section %zu out of file bounds\n", i);
                 return false;
             }
@@ -265,14 +262,13 @@ static bool image_build(const struct object_file *obj, const Elf64_Ehdr *eh,
 
 /* defined -> 镜像内地址；UNDEF -> 全局符号表；不可解析则 ok = false */
 static void *symbol_value(const struct object_file *obj, const Elf64_Ehdr *eh,
-                          const Elf64_Shdr *symsh, const struct etrel_image *img,
-                          size_t index, bool *ok) {
+                          const Elf64_Shdr *symsh, const struct etrel_image *img, size_t index,
+                          bool *ok) {
     *ok = false;
 
     const Elf64_Sym *syms = symbol_table(obj, symsh);
     const char      *strs = symbol_strings(obj, eh, symsh);
-    if (syms == NULL || strs == NULL ||
-        index >= symsh->sh_size / sizeof(Elf64_Sym)) {
+    if (syms == NULL || strs == NULL || index >= symsh->sh_size / sizeof(Elf64_Sym)) {
         return NULL;
     }
 
@@ -321,8 +317,8 @@ static bool register_symbols(const struct object_file *obj, const Elf64_Ehdr *eh
             if (type != STT_FUNC && type != STT_OBJECT) {
                 continue;
             }
-            if (s->st_shndx == SHN_UNDEF || s->st_shndx == SHN_ABS ||
-                s->st_shndx >= eh->e_shnum || img->section[s->st_shndx] == NULL) {
+            if (s->st_shndx == SHN_UNDEF || s->st_shndx == SHN_ABS || s->st_shndx >= eh->e_shnum ||
+                img->section[s->st_shndx] == NULL) {
                 continue;
             }
             const char *name = strs + s->st_name;
@@ -354,9 +350,8 @@ static void *find_entry(const struct object_file *obj, const Elf64_Ehdr *eh,
         size_t count = sh[i].sh_size / sizeof(Elf64_Sym);
         for (size_t j = 1; j < count; j++) {
             const Elf64_Sym *s = &syms[j];
-            if (ELF64_ST_TYPE(s->st_info) != STT_FUNC ||
-                s->st_shndx == SHN_UNDEF || s->st_shndx >= eh->e_shnum ||
-                img->section[s->st_shndx] == NULL) {
+            if (ELF64_ST_TYPE(s->st_info) != STT_FUNC || s->st_shndx == SHN_UNDEF ||
+                s->st_shndx >= eh->e_shnum || img->section[s->st_shndx] == NULL) {
                 continue;
             }
             if (strcmp(strs + s->st_name, want) == 0) {
@@ -430,7 +425,7 @@ static bool apply_relocations(const struct object_file *obj, const Elf64_Ehdr *e
         }
 
         const Elf64_Rela *rela  = (const Elf64_Rela *)(obj->data + sh[i].sh_offset);
-        size_t             count = sh[i].sh_size / sizeof(Elf64_Rela);
+        size_t            count = sh[i].sh_size / sizeof(Elf64_Rela);
 
         for (size_t j = 0; j < count; j++) {
             unsigned type  = (unsigned)ELF64_R_TYPE(rela[j].r_info);
@@ -479,8 +474,7 @@ static bool apply_relocations(const struct object_file *obj, const Elf64_Ehdr *e
             case R_X86_64_32S: { /* 绝对地址，32 位符号扩展 */
                 int64_t value = (int64_t)S + A;
                 if (value < INT32_MIN || value > INT32_MAX) {
-                    fprintf(stderr, "etrel: R_X86_64_32S overflow: %lld\n",
-                            (long long)value);
+                    fprintf(stderr, "etrel: R_X86_64_32S overflow: %lld\n", (long long)value);
                     return false;
                 }
                 if (!store_u32(place, avail, (uint32_t)(int32_t)value)) {
@@ -496,8 +490,7 @@ static bool apply_relocations(const struct object_file *obj, const Elf64_Ehdr *e
                 break;
 
             case R_X86_64_PC64: /* PC 相对，64 位 */
-                if (!store_u64(place, avail,
-                               (uint64_t)((int64_t)S + A - (int64_t)P))) {
+                if (!store_u64(place, avail, (uint64_t)((int64_t)S + A - (int64_t)P))) {
                     return false;
                 }
                 break;
@@ -515,8 +508,7 @@ static bool apply_relocations(const struct object_file *obj, const Elf64_Ehdr *e
                 if (!make_got_slot(S, &slot)) {
                     return false;
                 }
-                if (!store_pc32(place, avail,
-                                (int64_t)(uintptr_t)slot + A - (int64_t)P)) {
+                if (!store_pc32(place, avail, (int64_t)(uintptr_t)slot + A - (int64_t)P)) {
                     return false;
                 }
                 break;
@@ -548,9 +540,9 @@ void *crepl_backend_etrel_load(const char *source, const char *symbol) {
     }
     unlink(c_path); /* 编译完成，源码文件可以删除 */
 
-    struct object_file obj = {0};
-    struct etrel_image  img = {0};
-    void               *entry = NULL;
+    struct object_file obj   = {0};
+    struct etrel_image img   = {0};
+    void              *entry = NULL;
 
     if (!map_object(o_path, &obj)) {
         goto out;

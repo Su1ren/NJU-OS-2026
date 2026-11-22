@@ -15,7 +15,7 @@ void *crepl_backend_load(const char *source, const char *symbol) {
 
     if (!selected) {
         const char *env = getenv("CREPL_BACKEND");
-        use_etrel        = (env != NULL && strcmp(env, "etrel") == 0);
+        use_etrel       = (env != NULL && strcmp(env, "etrel") == 0);
         if (env != NULL && !use_etrel && strcmp(env, "dlopen") != 0) {
             fprintf(stderr, "Unknown CREPL_BACKEND '%s'; falling back to dlopen\n", env);
         }
