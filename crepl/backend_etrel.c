@@ -13,15 +13,10 @@
 #include <unistd.h>
 
 /*
- * ET_REL 自加载后端（骨架）。
+ * ET_REL 自加载后端。
  *
  * 流水线（对应 notes/M4.md §8）：
  *   gcc -c -fPIC -> 解析 ELF -> 段布局/拷贝 -> 符号表 -> 重定位 -> 入口登记
- *
- * 当前状态：
- *   - arena、ELF 校验、段拷贝、符号表、入口查找已就绪；
- *   - 重定位只处理 R_X86_64_NONE，其余类型留作 TODO（见 apply_relocations）。
- * 因此，不含重定位的常量函数/表达式可以跑通，函数调用会明确报「未实现」。
  */
 
 /* ================= 全局符号表：name -> 入口地址 ================= */
@@ -29,6 +24,7 @@
 #define CREPL_MAX_SYMBOLS 1024
 #define CREPL_MAX_NAME    64
 
+// 全局符号表项：符号名 -> 入口地址
 struct symbol_entry {
     char  name[CREPL_MAX_NAME];
     void *addr;
@@ -37,6 +33,8 @@ struct symbol_entry {
 static struct symbol_entry g_symbols[CREPL_MAX_SYMBOLS];
 static size_t              g_symbol_count;
 
+// 在全局符号表中查找符号名，返回地址；找不到返回 NULL
+// 顺序查找
 static void *symbol_lookup(const char *name) {
     for (size_t i = 0; i < g_symbol_count; i++) {
         if (strcmp(g_symbols[i].name, name) == 0) {
@@ -46,6 +44,7 @@ static void *symbol_lookup(const char *name) {
     return NULL;
 }
 
+// 在全局符号表中登记符号名和地址；重名按「后定义覆盖」处理
 static bool symbol_define(const char *name, void *addr) {
     if (strlen(name) >= CREPL_MAX_NAME) {
         fprintf(stderr, "etrel: symbol name too long: %s\n", name);
@@ -72,11 +71,15 @@ static bool symbol_define(const char *name, void *addr) {
 
 #define CREPL_ARENA_SIZE ((size_t)1 << 30) /* 1 GiB，足够 100 条输入 */
 
+// arena 分配器：在一个连续的 1 GiB 区域内分配内存，保证 PC32/PLT32 位移在 ±2GB 内
 static uint8_t *g_arena;
 static size_t   g_arena_used;
 
+/* arena 分配器的实现 */
 static bool arena_alloc(size_t size, size_t align, void **out) {
     if (g_arena == NULL) {
+        // 映射一块连续的 1 GiB 区域，PROT_NONE 避免占用物理内存；后续 mprotect
+        // 逐页打开，MAP_NORESERVE 避免过度预留 swap，fd=-1 表示匿名映射
         void *p = mmap(NULL, CREPL_ARENA_SIZE, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (p == MAP_FAILED) {
@@ -89,6 +92,7 @@ static bool arena_alloc(size_t size, size_t align, void **out) {
     if (align == 0) {
         align = 1;
     }
+    // 调整 g_arena_used 以满足对齐要求，并检查是否越界
     size_t start = (g_arena_used + align - 1) & ~(align - 1);
     if (start > CREPL_ARENA_SIZE || size > CREPL_ARENA_SIZE - start) {
         fprintf(stderr, "etrel: arena exhausted\n");
@@ -102,6 +106,7 @@ static bool arena_alloc(size_t size, size_t align, void **out) {
     size_t    page_size  = page > 0 ? (size_t)page : 4096;
     uintptr_t page_start = (uintptr_t)p & ~(uintptr_t)(page_size - 1);
     size_t    page_end   = ((uintptr_t)p - page_start + size + page_size - 1) & ~(page_size - 1);
+    // mprotect 失败时打印错误并返回 false
     if (mprotect((void *)page_start, page_end, PROT_READ | PROT_WRITE | PROT_EXEC) < 0) {
         perror("etrel: mprotect");
         return false;
@@ -114,17 +119,23 @@ static bool arena_alloc(size_t size, size_t align, void **out) {
 
 /* ================= ELF 对象文件 ================= */
 
+// ET_REL 可重定位对象文件（即 .o 文件）的内存映射和解析
+// 其他类型 ELF 还有 ET_EXEC（可执行文件，静态链接）、ET_DYN（共享库 .so 文件，PIE
+// 可执行文件）、ET_CORE（core dump）等
+// 符号表、重定位表还存在，必须经过链接装载后分配地址、解析符号、应用重定位才能执行
 struct object_file {
     uint8_t *data;
     size_t   size;
 };
 
+// ET_REL 镜像：在 arena 内的布局和段地址
 struct etrel_image {
     uint8_t  *base;    /* arena 内镜像起始地址 */
     size_t    size;    /* 镜像总大小 */
     uint8_t **section; /* 旧 shndx -> 镜像内地址（非 alloc 段为 NULL） */
 };
 
+// 将指定路径的 ET_REL 对象文件映射到内存，返回 object_file；失败返回 false（已打印错误）
 static bool map_object(const char *path, struct object_file *obj) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -132,6 +143,7 @@ static bool map_object(const char *path, struct object_file *obj) {
         return false;
     }
 
+    // 读取 ELF 文件头部，检查文件大小是否足够
     struct stat st;
     if (fstat(fd, &st) < 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr)) {
         fprintf(stderr, "etrel: object file is too small\n");
@@ -139,21 +151,24 @@ static bool map_object(const char *path, struct object_file *obj) {
         return false;
     }
 
+    // 映射 ELF 文件到内存
     void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (p == MAP_FAILED) {
         perror("etrel: mmap object");
         return false;
     }
-
+    // 设置 object_file 的 data 和 size
     obj->data = p;
     obj->size = (size_t)st.st_size;
     return true;
 }
 
+// 从传入的 object_file 中解析 ELF 头部，返回 Elf64_Ehdr；失败返回 NULL
 static const Elf64_Ehdr *object_header(const struct object_file *obj) {
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)obj->data;
 
+    // 检查 ELF 魔数、类、数据编码、类型、机器架构、段表偏移和大小等字段是否合法
     if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 || eh->e_ident[EI_CLASS] != ELFCLASS64 ||
         eh->e_ident[EI_DATA] != ELFDATA2LSB) {
         return NULL;
@@ -171,10 +186,12 @@ static const Elf64_Ehdr *object_header(const struct object_file *obj) {
     return eh;
 }
 
+// 从传入的 object_file 和 ELF 头部中获取段表，返回 Elf64_Shdr 数组；失败返回 NULL
 static const Elf64_Shdr *section_headers(const struct object_file *obj, const Elf64_Ehdr *eh) {
     return (const Elf64_Shdr *)(obj->data + eh->e_shoff);
 }
 
+// 从传入的 object_file 和段表中获取符号表，返回 Elf64_Sym 数组；失败返回 NULL
 static const Elf64_Sym *symbol_table(const struct object_file *obj, const Elf64_Shdr *symsh) {
     if (symsh->sh_type != SHT_SYMTAB || symsh->sh_offset > obj->size ||
         symsh->sh_size > obj->size - symsh->sh_offset) {
@@ -183,6 +200,7 @@ static const Elf64_Sym *symbol_table(const struct object_file *obj, const Elf64_
     return (const Elf64_Sym *)(obj->data + symsh->sh_offset);
 }
 
+// 从传入的 object_file、ELF 头部和符号表获取符号字符串表，返回字符串数组；失败返回 NULL
 static const char *symbol_strings(const struct object_file *obj, const Elf64_Ehdr *eh,
                                   const Elf64_Shdr *symsh) {
     if (symsh->sh_link >= eh->e_shnum) {
@@ -196,7 +214,7 @@ static const char *symbol_strings(const struct object_file *obj, const Elf64_Ehd
 }
 
 /* ================= 镜像布局与拷贝 ================= */
-
+// 从 object_file 和 ELF 头部中构建镜像，返回 etrel_image；失败返回 false（已打印错误）
 static bool image_build(const struct object_file *obj, const Elf64_Ehdr *eh,
                         struct etrel_image *img) {
     const Elf64_Shdr *sh = section_headers(obj, eh);
@@ -333,6 +351,7 @@ static bool register_symbols(const struct object_file *obj, const Elf64_Ehdr *eh
     return true;
 }
 
+// 在镜像中查找指定符号名的入口地址；找不到返回 NULL
 static void *find_entry(const struct object_file *obj, const Elf64_Ehdr *eh,
                         const struct etrel_image *img, const char *want) {
     const Elf64_Shdr *sh = section_headers(obj, eh);
@@ -527,10 +546,11 @@ static bool apply_relocations(const struct object_file *obj, const Elf64_Ehdr *e
 
 void *crepl_backend_etrel_load(const char *source, const char *symbol) {
     char c_path[64];
+    // 先把源代码写入临时文件，再编译成 .o 文件
     if (!crepl_write_source(source, c_path, sizeof(c_path))) {
         return NULL;
     }
-
+    // 编译成 .o 文件
     char o_path[sizeof(c_path) + 4];
     snprintf(o_path, sizeof(o_path), "%s.o", c_path);
 
@@ -540,6 +560,7 @@ void *crepl_backend_etrel_load(const char *source, const char *symbol) {
     }
     unlink(c_path); /* 编译完成，源码文件可以删除 */
 
+    // 读取并解析 .o 文件
     struct object_file obj   = {0};
     struct etrel_image img   = {0};
     void              *entry = NULL;
@@ -548,12 +569,14 @@ void *crepl_backend_etrel_load(const char *source, const char *symbol) {
         goto out;
     }
 
+    // 解析 ELF 头部，检查是否为有效的 x86-64 ET_REL 对象文件
     const Elf64_Ehdr *eh = object_header(&obj);
     if (eh == NULL) {
         fprintf(stderr, "etrel: not a valid x86-64 ET_REL object\n");
         goto out;
     }
 
+    // 将读取的对象文件构建为镜像映射到 arena 内存中，并按段落对齐
     if (!image_build(&obj, eh, &img)) {
         goto out;
     }
